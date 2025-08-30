@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>간단 화면공유 (GitHub Pages + WebRTC)</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Apple SD Gothic Neo,Noto Sans KR,sans-serif;max-width:840px;margin:40px auto;padding:0 16px}
+  h1{margin:0 0 12px}
+  fieldset{border:1px solid #ddd;border-radius:8px;margin:16px 0;padding:12px}
+  input,button{font-size:16px;padding:8px 10px;margin:6px 4px}
+  video{width:100%;max-height:70vh;background:#000;border-radius:8px}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  code{background:#f5f5f7;padding:2px 6px;border-radius:6px}
+</style>
+</head>
+<body>
+<h1>화면공유 데모</h1>
+<p>① “방 만들기(송출자)”로 내 화면을 공유하거나 ② “방 입장(시청자)”로 방 코드로 시청합니다.</p>
+
+<fieldset>
+  <legend>Firebase 설정</legend>
+  <p>Firebase 콘솔에서 웹 앱을 만들고 아래에 구성값을 붙여넣으세요.</p>
+  <textarea id="fbjson" style="width:100%;height:120px" placeholder='{"apiKey":"...","authDomain":"...","projectId":"...","storageBucket":"...","messagingSenderId":"...","appId":"..."}'></textarea>
+  <div><button id="btnInit">Firebase 초기화</button> <span id="initStatus"></span></div>
+</fieldset>
+
+<fieldset>
+  <legend>송출자(내 화면 공유)</legend>
+  <div class="row">
+    <button id="btnCreate">방 만들기</button>
+    <button id="btnStartShare" disabled>화면 공유 시작</button>
+    <button id="btnStopShare" disabled>중지</button>
+  </div>
+  <div>방 코드: <code id="roomId">(생성 전)</code></div>
+  <video id="localVideo" playsinline muted></video>
+</fieldset>
+
+<fieldset>
+  <legend>시청자(방 입장)</legend>
+  <div class="row">
+    <input id="joinId" placeholder="방 코드 입력"/>
+    <button id="btnJoin">방 입장</button>
+  </div>
+  <video id="remoteVideo" playsinline controls></video>
+</fieldset>
+
+<script type="module">
+let app, db;
+let pcSender, pcViewer;
+let localStream;
+
+// ============ Firebase 로드 ============
+async function initFirebase(cfg){
+  const { initializeApp } = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js');
+  const { getFirestore, doc, collection, setDoc, getDoc, updateDoc, onSnapshot, addDoc } =
+    await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js');
+  app = initializeApp(cfg);
+  db  = getFirestore(app);
+  // attach to window
+  Object.assign(window, {doc,collection,setDoc,getDoc,updateDoc,onSnapshot,addDoc});
+  document.getElementById('initStatus').textContent = '✅ 초기화 완료';
+}
+
+document.getElementById('btnInit').onclick = async () => {
+  try {
+    const cfg = JSON.parse(document.getElementById('fbjson').value.trim());
+    await initFirebase(cfg);
+    document.getElementById('btnCreate').disabled = false;
+    document.getElementById('btnJoin').disabled = false;
+  } catch(e){
+    alert('Firebase 설정(JSON) 오류: ' + e.message);
+  }
+};
+
+// ============ 송출자 로직 ============
+async function createRoom(){
+  if(!db) return alert('먼저 Firebase 초기화하세요.');
+  // PeerConnection
+  pcSender = new RTCPeerConnection();
+  pcSender.onicecandidate = async e => {
+    if(e.candidate){
+      const cRef = collection(db, 'rooms', roomRef.id, 'callerCandidates');
+      await addDoc(cRef, e.candidate.toJSON());
+    }
+  };
+
+  // 트랙 생성은 화면 공유 시작 후에 추가
+  const offer = await pcSender.createOffer();
+  await pcSender.setLocalDescription(offer);
+
+  const {doc, collection, setDoc} = window;
+  const roomRef = doc(collection(db, 'rooms'));
+  await setDoc(roomRef, { offer: { type: offer.type, sdp: offer.sdp }, createdAt: Date.now() });
+
+  // UI
+  document.getElementById('roomId').textContent = roomRef.id;
+  document.getElementById('btnStartShare').disabled = false;
+
+  // 원격(시청자) answer 수신
+  const unsub = onSnapshot(roomRef, async snap => {
+    const data = snap.data();
+    if(!pcSender.currentRemoteDescription && data && data.answer){
+      await pcSender.setRemoteDescription(new RTCSessionDescription(data.answer));
+    }
+  });
+
+  // 시청자 ICE 후보 수신
+  const calleeCandidates = collection(db, 'rooms', roomRef.id, 'calleeCandidates');
+  onSnapshot(calleeCandidates, (snapshot) => {
+    snapshot.docChanges().forEach(change => {
+      if(change.type === 'added'){
+        pcSender.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+      }
+    });
+  });
+
+  // 화면 공유 버튼 핸들러에 roomRef 보관
+  document.getElementById('btnStartShare').onclick = () => startShare(roomRef);
+  document.getElementById('btnStopShare').onclick  = stopShare;
+}
+
+async function startShare(roomRef){
+  try{
+    localStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  }catch{
+    // 일부 브라우저는 화면 오디오 미지원 → 마이크 대체
+    localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    try{
+      const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mic.getAudioTracks().forEach(t => localStream.addTrack(t));
+    }catch(_){}
+  }
+
+  localStream.getTracks().forEach(t => pcSender.addTrack(t, localStream));
+  const lv = document.getElementById('localVideo');
+  lv.srcObject = localStream; lv.muted = true; lv.play();
+
+  document.getElementById('btnStopShare').disabled = false;
+
+  // 방 문서에 offer는 이미 저장됨
+}
+
+function stopShare(){
+  if(localStream){
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+  if(pcSender){
+    pcSender.getSenders().forEach(s => { try{ s.track && s.track.stop(); }catch{} });
+    pcSender.close();
+    pcSender = null;
+  }
+  document.getElementById('btnStartShare').disabled = true;
+  document.getElementById('btnStopShare').disabled = true;
+}
+
+// ============ 시청자 로직 ============
+async function joinRoom(roomId){
+  if(!db) return alert('먼저 Firebase 초기화하세요.');
+  if(!roomId) return alert('방 코드를 입력하세요.');
+
+  const {doc, getDoc, collection, setDoc, addDoc, updateDoc} = window;
+
+  const roomRef = doc(collection(db, 'rooms'), roomId);
+  const snap = await getDoc(roomRef);
+  if(!snap.exists()) return alert('방이 존재하지 않습니다.');
+
+  const data = snap.data();
+  pcViewer = new RTCPeerConnection();
+  pcViewer.onicecandidate = async e => {
+    if(e.candidate){
+      const cRef = collection(db, 'rooms', roomId, 'calleeCandidates');
+      await addDoc(cRef, e.candidate.toJSON());
+    }
+  };
+  pcViewer.ontrack = e => {
+    const rv = document.getElementById('remoteVideo');
+    rv.srcObject = e.streams[0];
+    rv.play();
+  };
+
+  await pcViewer.setRemoteDescription(new RTCSessionDescription(data.offer));
+  const answer = await pcViewer.createAnswer();
+  await pcViewer.setLocalDescription(answer);
+  await updateDoc(roomRef, { answer: { type: answer.type, sdp: answer.sdp }, answeredAt: Date.now() });
+
+  // 송출자 ICE 후보 수신
+  const callerCandidates = collection(db, 'rooms', roomId, 'callerCandidates');
+  onSnapshot(callerCandidates, (snapshot) => {
+    snapshot.docChanges().forEach(change => {
+      if(change.type === 'added'){
+        pcViewer.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+      }
+    });
+  });
+}
+
+// 버튼 연결
+document.getElementById('btnCreate').onclick = createRoom;
+document.getElementById('btnJoin').onclick = () => joinRoom(document.getElementById('joinId').value.trim());
+</script>
+</body>
+</html>
